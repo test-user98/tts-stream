@@ -148,6 +148,22 @@ class MegakernelQwen3TTS:
     def clear_voice_prompt_cache(self) -> None:
         self._voice_prompt_cache.clear()
 
+    def warm_speaker(
+        self,
+        ref_audio,
+        ref_text: str | None = None,
+        x_vector_only_mode: bool = True,
+    ) -> None:
+        """Pre-encode a reference speaker so the first real request has zero cold-start overhead.
+
+        Call this once after loading the model, before serving requests.
+        """
+        self._get_cached_voice_prompt(
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            x_vector_only_mode=x_vector_only_mode,
+        )
+
     def _prepare_voice_clone_inputs(
         self,
         text: str,
