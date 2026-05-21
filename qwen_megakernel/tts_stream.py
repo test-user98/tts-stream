@@ -79,6 +79,8 @@ class MegakernelQwen3TTS:
         self.kernel = TTSTalkerMegakernel(self.talker, max_seq_len=max_seq_len)
         self.code_predictor_kernel = CodePredictorMegakernel(self.talker.code_predictor)
         self._voice_prompt_cache: dict[tuple[object, ...], tuple[dict, list, torch.Tensor | None]] = {}
+        # Serializes requests: the talker KV cache is stateful; concurrent calls corrupt it.
+        self._inference_lock = asyncio.Lock()
 
         # Pre-stack codec embedding tables for O(1) batch lookup.
         # Replaces 15 separate Python→CUDA dispatch calls per step (~57 ms) with one
@@ -104,6 +106,11 @@ class MegakernelQwen3TTS:
         kwargs.setdefault("dtype", torch.bfloat16)
         qwen_tts_model = Qwen3TTSModel.from_pretrained(model_name, **kwargs)
         return cls(qwen_tts_model, max_seq_len=max_seq_len)
+
+    @staticmethod
+    def _validate_ref_audio(ref_audio) -> None:
+        if isinstance(ref_audio, (str, os.PathLike)) and not os.path.exists(ref_audio):
+            raise FileNotFoundError(f"Reference audio not found: {ref_audio}")
 
     def _voice_cache_key(
         self,
@@ -158,6 +165,7 @@ class MegakernelQwen3TTS:
 
         Call this once after loading the model, before serving requests.
         """
+        self._validate_ref_audio(ref_audio)
         self._get_cached_voice_prompt(
             ref_audio=ref_audio,
             ref_text=ref_text,
@@ -284,104 +292,119 @@ class MegakernelQwen3TTS:
         x_vector_only_mode: bool = True,
         max_new_tokens: int = 4096,
         max_repeat: int = 4,
+        generation_timeout_s: float = 30.0,
         metrics: TTSMetrics | None = None,
         timing_logger: TimingLogger | None = None,
     ) -> AsyncIterator[torch.Tensor]:
         if ref_audio is None:
             raise ValueError("ref_audio is required for the Base voice-clone model.")
+        self._validate_ref_audio(ref_audio)
 
-        t0 = time.perf_counter()
-        prompt_embeds, trailing_text, tts_pad_embed, prompt_prepare_ms = self._prepare_voice_clone_inputs(
-            text,
-            language=language,
-            ref_audio=ref_audio,
-            ref_text=ref_text,
-            x_vector_only_mode=x_vector_only_mode,
-        )
-        if metrics is not None:
-            metrics.prompt_prepare_ms = prompt_prepare_ms
-        if timing_logger is not None:
-            timing_logger.event("prompt_prepared", prompt_prepare_ms=prompt_prepare_ms, prompt_tokens=prompt_embeds.shape[1])
+        async with self._inference_lock:
+            t0 = time.perf_counter()
+            deadline = t0 + generation_timeout_s
 
-        self.kernel.reset()
-        next_first_code = None
-        prefill_t0 = time.perf_counter()
-        n_prefill = prompt_embeds.shape[1]
-        for i in range(n_prefill - 1):
-            self.kernel.step_embed_async(prompt_embeds[:, i : i + 1, :])
-        # Final prefill token: one sync to get first_code for EOS check
-        step_t0 = time.perf_counter()
-        next_first_code = self.kernel.step_embed(prompt_embeds[:, -1:, :])
-        if metrics is not None:
-            metrics.megakernel_step_ms += (time.perf_counter() - step_t0) * 1000.0
-        past_hidden = self.kernel.last_hidden_bf16
-        if metrics is not None:
-            metrics.prefill_ms = (time.perf_counter() - prefill_t0) * 1000.0
-        if timing_logger is not None:
-            timing_logger.event("prefill_done", prefill_ms=(time.perf_counter() - prefill_t0) * 1000.0, prompt_tokens=prompt_embeds.shape[1])
-
-        codebook_count = 0
-        eos = self.model.config.talker_config.codec_eos_token_id
-        generation_t0 = time.perf_counter()
-        _prev_code: int | None = None
-        _repeat_count: int = 0
-        for generation_step in range(max_new_tokens):
-            if next_first_code == eos:
+            try:
+                prompt_embeds, trailing_text, tts_pad_embed, prompt_prepare_ms = self._prepare_voice_clone_inputs(
+                    text,
+                    language=language,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    x_vector_only_mode=x_vector_only_mode,
+                )
+                if metrics is not None:
+                    metrics.prompt_prepare_ms = prompt_prepare_ms
                 if timing_logger is not None:
-                    timing_logger.event("eos", generation_step=generation_step)
-                break
-            # Stop if the same token repeats: megakernel can diverge from the reference
-            # and get stuck in a loop. max_repeat consecutive identical tokens = done.
-            if next_first_code == _prev_code:
-                _repeat_count += 1
-                if _repeat_count >= max_repeat:
+                    timing_logger.event("prompt_prepared", prompt_prepare_ms=prompt_prepare_ms, prompt_tokens=prompt_embeds.shape[1])
+
+                self.kernel.reset()
+                next_first_code = None
+                prefill_t0 = time.perf_counter()
+                n_prefill = prompt_embeds.shape[1]
+                for i in range(n_prefill - 1):
+                    self.kernel.step_embed_async(prompt_embeds[:, i : i + 1, :])
+                # Final prefill token: one sync to get first_code for EOS check
+                step_t0 = time.perf_counter()
+                next_first_code = self.kernel.step_embed(prompt_embeds[:, -1:, :])
+                if metrics is not None:
+                    metrics.megakernel_step_ms += (time.perf_counter() - step_t0) * 1000.0
+                past_hidden = self.kernel.last_hidden_bf16
+                if metrics is not None:
+                    metrics.prefill_ms = (time.perf_counter() - prefill_t0) * 1000.0
+                if timing_logger is not None:
+                    timing_logger.event("prefill_done", prefill_ms=(time.perf_counter() - prefill_t0) * 1000.0, prompt_tokens=prompt_embeds.shape[1])
+
+                codebook_count = 0
+                eos = self.model.config.talker_config.codec_eos_token_id
+                generation_t0 = time.perf_counter()
+                _prev_code: int | None = None
+                _repeat_count: int = 0
+                for generation_step in range(max_new_tokens):
+                    if time.perf_counter() > deadline:
+                        raise asyncio.TimeoutError(
+                            f"TTS generation timed out after {generation_timeout_s}s at step {generation_step}"
+                        )
+
+                    if next_first_code == eos:
+                        if timing_logger is not None:
+                            timing_logger.event("eos", generation_step=generation_step)
+                        break
+                    # Stop if the same token repeats: megakernel can diverge from the reference
+                    # and get stuck in a loop. max_repeat consecutive identical tokens = done.
+                    if next_first_code == _prev_code:
+                        _repeat_count += 1
+                        if _repeat_count >= max_repeat:
+                            if timing_logger is not None:
+                                timing_logger.event("repeat_stop", generation_step=generation_step, code=next_first_code)
+                            break
+                    else:
+                        _prev_code = next_first_code
+                        _repeat_count = 1
+
+                    input_ids = torch.tensor([[next_first_code]], dtype=torch.long, device=self.talker.device)
+                    last_id_hidden = self.talker.get_input_embeddings()(input_ids).to(torch.bfloat16)
+                    predictor_t0 = time.perf_counter()
+                    mk_sequences = self.code_predictor_kernel.generate(past_hidden, last_id_hidden)
+                    if metrics is not None:
+                        metrics.code_predictor_ms += (time.perf_counter() - predictor_t0) * 1000.0
+                    codec_ids = torch.cat((input_ids, mk_sequences), dim=-1)
+                    yield codec_ids[0].detach()
+                    codebook_count += 1
+                    if metrics is not None:
+                        metrics.codec_steps = codebook_count
                     if timing_logger is not None:
-                        timing_logger.event("repeat_stop", generation_step=generation_step, code=next_first_code)
-                    break
-            else:
-                _prev_code = next_first_code
-                _repeat_count = 1
+                        timing_logger.event("codebook", generation_step=generation_step, first_code=int(next_first_code))
 
-            input_ids = torch.tensor([[next_first_code]], dtype=torch.long, device=self.talker.device)
-            last_id_hidden = self.talker.get_input_embeddings()(input_ids).to(torch.bfloat16)
-            predictor_t0 = time.perf_counter()
-            mk_sequences = self.code_predictor_kernel.generate(past_hidden, last_id_hidden)
-            if metrics is not None:
-                metrics.code_predictor_ms += (time.perf_counter() - predictor_t0) * 1000.0
-            codec_ids = torch.cat((input_ids, mk_sequences), dim=-1)
-            yield codec_ids[0].detach()
-            codebook_count += 1
-            if metrics is not None:
-                metrics.codec_steps = codebook_count
-            if timing_logger is not None:
-                timing_logger.event("codebook", generation_step=generation_step, first_code=int(next_first_code))
+                    # Batch lookup: one CUDA index op instead of 15 Python→CUDA dispatch calls.
+                    # _codec_embeds_stacked: [15, vocab, hidden], mk_sequences[0]: [15]
+                    pred_embeds = self._codec_embeds_stacked[self._codec_embed_idx, mk_sequences[0]]
+                    codec_hiddens = torch.cat([last_id_hidden, pred_embeds.unsqueeze(0)], dim=1)
+                    next_embed = codec_hiddens.sum(1, keepdim=True)
+                    if generation_step < trailing_text.shape[1]:
+                        next_embed = next_embed + trailing_text[:, generation_step : generation_step + 1, :]
+                    else:
+                        next_embed = next_embed + tts_pad_embed
 
-            # Batch lookup: one CUDA index op instead of 15 Python→CUDA dispatch calls.
-            # _codec_embeds_stacked: [15, vocab, hidden], mk_sequences[0]: [15]
-            pred_embeds = self._codec_embeds_stacked[self._codec_embed_idx, mk_sequences[0]]
-            codec_hiddens = torch.cat([last_id_hidden, pred_embeds.unsqueeze(0)], dim=1)
-            next_embed = codec_hiddens.sum(1, keepdim=True)
-            if generation_step < trailing_text.shape[1]:
-                next_embed = next_embed + trailing_text[:, generation_step : generation_step + 1, :]
-            else:
-                next_embed = next_embed + tts_pad_embed
+                    step_t0 = time.perf_counter()
+                    next_first_code = self.kernel.step_embed(next_embed)
+                    if metrics is not None:
+                        metrics.megakernel_step_ms += (time.perf_counter() - step_t0) * 1000.0
+                    past_hidden = self.kernel.last_hidden_bf16
+                    if generation_step == 0 and metrics is not None:
+                        metrics.first_codec_ms = (time.perf_counter() - t0) * 1000.0
+                    if generation_step % 4 == 0:
+                        await asyncio.sleep(0)
 
-            step_t0 = time.perf_counter()
-            next_first_code = self.kernel.step_embed(next_embed)
-            if metrics is not None:
-                metrics.megakernel_step_ms += (time.perf_counter() - step_t0) * 1000.0
-            past_hidden = self.kernel.last_hidden_bf16
-            if generation_step == 0 and metrics is not None:
-                metrics.first_codec_ms = (time.perf_counter() - t0) * 1000.0
-            if generation_step % 4 == 0:
-                await asyncio.sleep(0)
+                if metrics is not None:
+                    elapsed = time.perf_counter() - t0
+                    metrics.generation_ms = (time.perf_counter() - generation_t0) * 1000.0
+                    metrics.codec_tokens_per_s = codebook_count / elapsed if elapsed > 0 else None
+                if timing_logger is not None:
+                    timing_logger.event("generation_done", codec_steps=codebook_count)
 
-        if metrics is not None:
-            elapsed = time.perf_counter() - t0
-            metrics.generation_ms = (time.perf_counter() - generation_t0) * 1000.0
-            metrics.codec_tokens_per_s = codebook_count / elapsed if elapsed > 0 else None
-        if timing_logger is not None:
-            timing_logger.event("generation_done", codec_steps=codebook_count)
+            except Exception:
+                self.kernel.reset()
+                raise
 
     async def stream_pcm_chunks(
         self,
