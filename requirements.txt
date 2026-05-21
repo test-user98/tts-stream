@@ -1,0 +1,10 @@
+torch>=2.0.0
+transformers>=4.40.0
+triton>=2.2.0
+ninja
+accelerate
+qwen-tts==0.1.1
+pipecat-ai>=0.0.104
+fastapi
+uvicorn[standard]
+soundfile
