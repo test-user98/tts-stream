@@ -135,6 +135,36 @@ tokens before repeat-stop are silence padding. Trimming at repeat boundary is cl
 
 ---
 
+## Step 9 — warm_speaker() + production safety hardening
+
+**warm_speaker():** New method that pre-encodes the reference speaker at startup, populating
+the voice prompt cache before any real request arrives. Eliminates the 1.6 s cold-run on the
+first request. Call once after `from_pretrained()`, before serving.
+
+**Concurrent request safety:** Added `asyncio.Lock` (`_inference_lock`) around the entire
+generation body in `stream_codebooks`. The talker KV cache is stateful; two overlapping
+requests would corrupt each other's KV state and produce garbled audio or a crash.
+The lock serializes requests with zero performance impact for single-stream use.
+
+**Error recovery:** Wrapped generation in `try/except` that calls `kernel.reset()` on any
+exception (GPU OOM, model error, etc.) before re-raising. Without this, a failed request
+leaves the KV cache in a dirty state that corrupts the next request.
+
+**Generation timeout:** Added `generation_timeout_s=30.0` parameter with a wall-clock check
+at every generation step. Raises `asyncio.TimeoutError` if the model stalls beyond the
+deadline. At ~2.3 ms/step and typical utterances ≤ 10 s of audio, 30 s is a very safe
+ceiling that will never trigger on healthy generation.
+
+**Reference audio validation:** Added `_validate_ref_audio()` called from both
+`warm_speaker()` and `stream_codebooks()`. Raises `FileNotFoundError` immediately if the
+file path does not exist, rather than letting the voice encoder fail deep in C++ with an
+unintelligible error.
+
+**No performance impact:** All guards are either zero-cost on the happy path (lock
+uncontested, no exception raised) or sub-microsecond (one `perf_counter()` call per step).
+
+---
+
 ## Dead ends / things that didn't work
 
 ### torch.compile on speech tokenizer
