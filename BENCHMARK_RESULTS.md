@@ -4,6 +4,9 @@ Hardware: NVIDIA RTX 5090 (Vast.ai), CUDA 12+, PyTorch 2.7
 Model: Qwen/Qwen3-TTS-12Hz-0.6B-Base
 Date: 2026-05-21
 
+> How these numbers are defined and measured: see [BENCHMARK_METHODOLOGY.md](BENCHMARK_METHODOLOGY.md).
+> Reproduce with `python -m qwen_megakernel.bench_tts --ref-audio <clip> --ref-text "..."`.
+
 ## Performance Targets
 | Metric | General Target | Strict Target |
 |--------|---------------|--------------|
@@ -42,7 +45,7 @@ Date: 2026-05-21
 | left_context_steps 25 → 10 | — | ~50% faster vocoder |
 | Repetition-detection stop (EOS fix) | enables correct termination | — |
 
-## Raw Timing Data (bench_final.py, warm run 2)
+## Raw Timing Data (qwen_megakernel/bench_tts.py, warm run 2)
 ```json
 {"run": "warm_cs6", "ttfc_ms": 54.3, "rtf": 0.1067, "audio_s": 1.68,
  "prefill_ms": 8.0, "codec_steps": 21, "chunks": 4,
